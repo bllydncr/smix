@@ -28,15 +28,28 @@ static void run(const Arg *a);
 static void spawn(const Arg *a);
 static void refresh(void);
 static void refresh_k(const Arg *a);
+static void volume(const Arg *a);
+static void togglech(const Arg *a);
+static void togglelock(const Arg *a);
 static void quit(const Arg *a);
 
 #include "config.h"
+
+#ifndef CHLOCK
+#define CHLOCK 1
+#endif
 
 static Node nodes[NSEC][MAXN];
 static int cnt[NSEC], sel[NSEC], off[NSEC], tab = SINK;
 static volatile sig_atomic_t running = 1;
 static struct termios orig;
 static const char *tabname[NSEC] = { "Sinks", "Sources", "Streams" };
+
+#define MAXCH 8
+static int openid = -1, chsel = -1, chn, chv[MAXCH];
+static char chname[MAXCH][16];
+static const char *msg;
+static int chlock = CHLOCK;
 
 static int
 getvol(int id, int *vol, int *muted)
@@ -55,6 +68,116 @@ getvol(int id, int *vol, int *muted)
 	}
 	pclose(f);
 	return ok ? 0 : -1;
+}
+
+/*
+ * Per-channel volumes go through the pulse layer (pactl + pipewire-pulse),
+ * the same path pulsemixer uses, so hardware (ALSA route) volumes work too.
+ * Pulse indexes equal wpctl ids for sinks/sources but not for streams, so
+ * blocks are matched on their object.id property.
+ */
+typedef struct { int idx, objid, n, v[MAXCH]; char nm[MAXCH][16]; } Blk;
+
+static const char *pk[]   = { "sinks", "sources", "sink-inputs", "source-outputs" };
+static const char *pset[] = { "sink", "source", "sink-input", "source-output" };
+static int chkind, chidx;
+static const struct { const char *l, *s; } chshort[] = {
+	{ "front-left", "FL" }, { "front-right", "FR" }, { "front-center", "FC" },
+	{ "rear-left", "RL" }, { "rear-right", "RR" }, { "rear-center", "RC" },
+	{ "side-left", "SL" }, { "side-right", "SR" }, { "lfe", "LFE" },
+};
+
+static int
+take(const Blk *b, int id, int kind)
+{
+	int i;
+
+	if (!b->n || !(b->objid == id || (b->objid < 0 && b->idx == id)))
+		return 0;
+	for (i = 0; i < b->n; i++) {
+		chv[i] = b->v[i];
+		snprintf(chname[i], sizeof chname[i], "%s", b->nm[i]);
+	}
+	chn = b->n;
+	chidx = b->idx;
+	chkind = kind;
+	return 1;
+}
+
+static int
+pulsech(int kind, int id)
+{
+	char line[512], cmd[64], *p, *q, *e;
+	const char *s;
+	size_t k, len;
+	Blk b;
+	FILE *f;
+	int found = 0;
+
+	snprintf(cmd, sizeof cmd, "pactl list %s 2>/dev/null", pk[kind]);
+	if (!(f = popen(cmd, "r")))
+		return 0;
+	memset(&b, 0, sizeof b);
+	b.objid = -1;
+	while (fgets(line, sizeof line, f)) {
+		if (line[0] != '\t' && line[0] != ' ' && (p = strchr(line, '#'))) {
+			if ((found = take(&b, id, kind)))
+				break;
+			memset(&b, 0, sizeof b);
+			b.idx = atoi(p + 1);
+			b.objid = -1;
+		} else if (!strncmp(line, "\tVolume:", 8)) {
+			p = line + 8;
+			while (b.n < MAXCH && (q = strchr(p, ':'))) {
+				for (s = p; *s == ' ' || *s == ','; s++)
+					;
+				len = q - s;
+				if (len >= sizeof b.nm[0])
+					len = sizeof b.nm[0] - 1;
+				memcpy(b.nm[b.n], s, len);
+				b.nm[b.n][len] = 0;
+				for (k = 0; k < LEN(chshort); k++)
+					if (!strcmp(b.nm[b.n], chshort[k].l))
+						snprintf(b.nm[b.n], sizeof b.nm[0], "%s", chshort[k].s);
+				strtol(q + 1, &e, 10);
+				if (!(e = strchr(e, '/')))
+					break;
+				b.v[b.n++] = atoi(e + 1);
+				if (!(p = strstr(e, "dB")))
+					break;
+				p += 2;
+			}
+		} else if ((p = strstr(line, "object.id = \"")))
+			b.objid = atoi(p + 13);
+	}
+	if (!found)
+		found = take(&b, id, kind);
+	pclose(f);
+	return found;
+}
+
+static void
+loadch(void)
+{
+	int i, found = 0;
+
+	chn = 0;
+	if (openid < 0)
+		return;
+	for (i = 0; i < cnt[tab]; i++)
+		if (nodes[tab][i].id == openid)
+			found = 1;
+	if (!found) {
+		openid = chsel = -1;
+		return;
+	}
+	found = tab == STREAM ? pulsech(2, openid) || pulsech(3, openid)
+	                      : pulsech(tab, openid);
+	if (!found || chn < 2) {
+		chn = 0;
+		openid = chsel = -1;
+	} else if (chsel >= chn)
+		chsel = chn - 1;
 }
 
 static void
@@ -151,6 +274,9 @@ refresh(void)
 		if (sel[t] >= cnt[t])
 			sel[t] = cnt[t] ? cnt[t] - 1 : 0;
 	}
+	if (chsel >= 0 && (!cnt[tab] || nodes[tab][sel[tab]].id != openid))
+		chsel = -1;
+	loadch();
 }
 
 /* run cmd through sh; %d is replaced with the selected node id */
@@ -216,22 +342,112 @@ spawn(const Arg *a)
 static void
 movesel(const Arg *a)
 {
-	sel[tab] += a->i;
-	if (sel[tab] >= cnt[tab])
-		sel[tab] = cnt[tab] - 1;
-	if (sel[tab] < 0)
-		sel[tab] = 0;
+	int d = a->i, id = cnt[tab] ? nodes[tab][sel[tab]].id : -1;
+
+	for (; d > 0; d--) {
+		if (id == openid && chsel + 1 < chn)
+			chsel++;
+		else if (sel[tab] + 1 < cnt[tab]) {
+			sel[tab]++;
+			chsel = -1;
+			id = nodes[tab][sel[tab]].id;
+		}
+	}
+	for (; d < 0; d++) {
+		if (chsel >= 0)
+			chsel--;
+		else if (sel[tab] > 0) {
+			sel[tab]--;
+			id = nodes[tab][sel[tab]].id;
+			chsel = id == openid ? chn - 1 : -1;
+		}
+	}
+}
+
+/* c: show/hide the channels of the selected node */
+static void
+togglech(const Arg *a)
+{
+	int id = cnt[tab] ? nodes[tab][sel[tab]].id : -1;
+
+	(void)a;
+	if (id < 0)
+		return;
+	if (id == openid) {
+		openid = chsel = -1;
+		chn = 0;
+		return;
+	}
+	openid = id;
+	chsel = -1;
+	loadch();
+	if (openid < 0)
+		msg = " no channel info (needs pactl from pulseaudio-utils + pipewire-pulse, >= 2 channels)";
+}
+
+/* space: lock channels together (all move by the same amount) or not */
+static void
+togglelock(const Arg *a)
+{
+	(void)a;
+	chlock = !chlock;
+	msg = chlock ? " channels locked: h/l change all channels together"
+	             : " channels unlocked: h/l change only the selected channel";
+}
+
+/* volume change in percent: on a channel row only that channel, else the node */
+static void
+volume(const Arg *a)
+{
+	char cmd[512];
+	size_t n;
+	int i, v, d, hi, lo;
+
+	if (chsel >= 0 && chn > 0 && openid >= 0) {
+		d = a->i;
+		if (chlock) { /* keep balance: limit the step so no channel leaves 0..maxvol */
+			for (i = 0, hi = 0, lo = maxvol; i < chn; i++) {
+				if (chv[i] > hi)
+					hi = chv[i];
+				if (chv[i] < lo)
+					lo = chv[i];
+			}
+			if (d > maxvol - hi)
+				d = maxvol - hi;
+			if (d < -lo)
+				d = -lo;
+		}
+		n = snprintf(cmd, sizeof cmd, "pactl set-%s-volume %d",
+		    pset[chkind], chidx);
+		for (i = 0; i < chn; i++) {
+			v = chv[i] + (chlock || i == chsel ? d : 0);
+			if (v < 0)
+				v = 0;
+			if (v > maxvol)
+				v = maxvol;
+			n += snprintf(cmd + n, sizeof cmd - n, " %d%%", v);
+		}
+	} else
+		snprintf(cmd, sizeof cmd, "wpctl set-volume -l %d.%02d %%d %d%%%c",
+		    maxvol / 100, maxvol % 100, a->i < 0 ? -a->i : a->i,
+		    a->i < 0 ? '-' : '+');
+	exec_cmd(cmd, 1);
+	exec_cmd(postcmd, 0);
 }
 
 static void
 switchtab(const Arg *a)
 {
+	openid = chsel = -1;
+	chn = 0;
 	tab = (tab + a->i + NSEC) % NSEC;
 }
 
 static void
 settab(const Arg *a)
 {
+	openid = chsel = -1;
+	chn = 0;
 	tab = a->i % NSEC;
 }
 
@@ -269,7 +485,10 @@ static void
 draw(void)
 {
 	struct winsize ws = { 0 };
-	int W, H, rows, barw, namew, i, t, fill, cur;
+	int W, H, rows, barw, namew, i, t, fill, n = 0, cur, curpos = 0, vol, muted, ch;
+	int rn[MAXN + MAXCH], rc[MAXN + MAXCH];
+	char buf[160];
+	const char *name;
 	Node *nd;
 
 	ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
@@ -281,10 +500,22 @@ draw(void)
 	if (namew < 4)
 		namew = 4;
 
-	if (sel[tab] < off[tab])
-		off[tab] = sel[tab];
-	if (sel[tab] >= off[tab] + rows)
-		off[tab] = sel[tab] - rows + 1;
+	/* flat row list: nodes, with channel rows under the opened node */
+	for (i = 0; i < cnt[tab]; i++) {
+		if (i == sel[tab])
+			curpos = n + chsel + 1;
+		rn[n] = i;
+		rc[n++] = -1;
+		if (nodes[tab][i].id == openid)
+			for (ch = 0; ch < chn && n < (int)LEN(rn); ch++) {
+				rn[n] = i;
+				rc[n++] = ch;
+			}
+	}
+	if (curpos < off[tab])
+		off[tab] = curpos;
+	if (curpos >= off[tab] + rows)
+		off[tab] = curpos - rows + 1;
 
 	fputs("\033[H", stdout);
 	for (t = 0; t < NSEC; t++)
@@ -293,26 +524,35 @@ draw(void)
 
 	if (!cnt[tab])
 		fputs(" (none)\033[K\r\n", stdout);
-	for (i = off[tab]; i < cnt[tab] && i < off[tab] + rows; i++) {
-		nd = &nodes[tab][i];
-		cur = i == sel[tab];
+	for (i = off[tab]; i < n && i < off[tab] + rows; i++) {
+		nd = &nodes[tab][rn[i]];
+		cur = i == curpos;
+		if (rc[i] < 0) {
+			name = nd->name;
+			vol = nd->vol;
+		} else {
+			snprintf(buf, sizeof buf, "   \xe2\x94\x94 %s", chname[rc[i]]);
+			name = buf;
+			vol = chv[rc[i]];
+		}
+		muted = nd->muted;
 		if (cur)
 			fputs("\033[7m", stdout);
-		printf("%c ", nd->def ? '*' : ' ');
-		putname(nd->name, namew);
+		printf("%c ", rc[i] < 0 && nd->def ? '*' : ' ');
+		putname(name, namew);
 		putchar(' ');
-		if (nd->muted)
+		if (muted)
 			fputs("\033[2m", stdout);
-		fill = nd->vol * barw / maxvol;
+		fill = vol * barw / maxvol;
 		if (fill > barw)
 			fill = barw;
 		for (t = 0; t < barw; t++)
 			putchar(t < fill ? '#' : '-');
-		printf("\033[22m %3d%% %c", nd->vol, nd->muted ? 'M' : ' ');
+		printf("\033[22m %3d%% %c", vol, rc[i] < 0 ? (muted ? 'M' : ' ') : (chlock ? 'L' : ' '));
 		fputs("\033[0m\033[K\r\n", stdout);
 	}
 	fputs("\033[J", stdout);
-	printf("\033[%d;1H\033[2m%.*s\033[0m", H, W, statusline);
+	printf("\033[%d;1H\033[2m%.*s\033[0m", H, W, msg ? msg : statusline);
 	fflush(stdout);
 }
 
@@ -396,6 +636,7 @@ main(void)
 		if (r > 0 && (p.revents & POLLIN)) {
 			if ((k = readkey()) < 0)
 				break;
+			msg = NULL;
 			for (i = 0; i < LEN(keys); i++)
 				if (keys[i].key == k && keys[i].fn)
 					keys[i].fn(&keys[i].arg);

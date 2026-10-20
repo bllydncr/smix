@@ -20,6 +20,7 @@ compiler and POSIX libc.
 - Three sections: **Sinks**, **Sources**, **Streams** (per-application volume)
 - Volume bar with overdrive support (default full bar = 150%)
 - Mute indicator, default device marked with `*`
+- Per-channel volume (FL, FR, ...) for nodes that expose channels, opened with `c`
 - Auto-refresh, so changes made by other programs show up on their own
 - Every key is bound to a shell command in `config.h`
 - Commands can use the selected node's ID (`%d`) and get it as an environment
@@ -30,12 +31,14 @@ compiler and POSIX libc.
 ## Requirements
 
 - `wpctl` (from `wireplumber`) and a running PipeWire session
+- `pactl` (`pulseaudio-utils`) and a running `pipewire-pulse`, only for the
+  per-channel view (the same layer pulsemixer uses)
 - A C99 compiler and `make`
 
 On Void Linux:
 
 ```sh
-sudo xbps-install -S pipewire wireplumber base-devel
+sudo xbps-install -S pipewire wireplumber pulseaudio-utils base-devel
 ```
 
 ## Build and install
@@ -47,6 +50,10 @@ sudo make install        # installs to /usr/local/bin (PREFIX=... to change)
 
 The first `make` copies `config.def.h` to `config.h`. After editing `config.h`
 just run `make` again. To start over from the defaults, delete `config.h`.
+
+`config.h` is never overwritten. After updating smix, run
+`diff config.def.h config.h` and add any new key bindings (for example `c` for
+channels) to your `config.h`. `make` warns when `config.def.h` is newer.
 
 ## Usage
 
@@ -60,12 +67,22 @@ smix
 | `l` / `h`        | volume +5% / -5%                |
 | `L` / `H`        | volume +1% / -1%                |
 | `0`              | set volume to 100%              |
+| `c`, `Enter`     | show / hide channels of the node|
+| `Space`          | lock / unlock channels together |
 | `m`              | toggle mute                     |
 | `d`              | set as default (sinks, sources) |
 | `Tab`, `1` `2` `3` | switch section                |
 | `r`              | refresh now                     |
 | `p`              | launch `pavucontrol`            |
 | `q`, `Esc`       | quit                            |
+
+On a node row `h`/`l` change the whole node. After pressing `c`, the node's
+channels appear underneath it. Select one with `j`/`k` and `h`/`l` then change
+only that channel, which is how you adjust balance. Channels start locked
+(`L` in the last column): `h`/`l` then move all channels together and keep
+the balance. `Space` unlocks them, set `CHLOCK` to 0 in `config.h` to start
+unlocked. A node with fewer than two
+channels, or without channel info, simply stays closed.
 
 These are only the defaults. Change them in `config.h`.
 
@@ -99,7 +116,10 @@ Available functions:
 | ----------- | ----------- | --------------------------------------------------- |
 | `run`       | `.s` command| run via `sh -c`, wait for it, then refresh; then run `postcmd` |
 | `spawn`     | `.s` command| run detached, no waiting (GUI programs, long jobs)  |
-| `movesel`   | `.i` offset | move the selection                                  |
+| `movesel`   | `.i` offset | move the selection (also steps through opened channels) |
+| `volume`    | `.i` percent| change volume; on a channel row only that channel   |
+| `togglech`  | none        | show / hide channels of the selected node           |
+| `togglelock`| none        | lock channels together / adjust one channel alone   |
 | `switchtab` | `.i` offset | next / previous section                             |
 | `settab`    | `.i` index  | jump to a section (0 sinks, 1 sources, 2 streams)   |
 | `refresh_k` | none        | refresh now                                         |
@@ -143,6 +163,11 @@ static const char *postcmd = "pkill -RTMIN+10 dwmblocks";
 - `wpctl status` is parsed once per refresh to list the nodes under the
   `Sinks`, `Sources` and `Streams` headings of the `Audio` section. The
   selection is tracked by node ID, so it survives list changes.
+- Channel volumes are read with `pactl list <kind>` and written with
+  `pactl set-<kind>-volume <index> <p1>% <p2>% ...`. This goes through
+  pipewire-pulse, which also drives hardware (ALSA route) volumes. Sinks and
+  sources are matched to wpctl ids by pulse index, streams by their
+  `object.id` property, because stream indexes differ from wpctl ids.
 - Stream entries in `wpctl status` carry no volume, so smix asks
   `wpctl get-volume <id>` for each stream. With many streams, raise
   `refreshms`.
@@ -152,7 +177,6 @@ static const char *postcmd = "pkill -RTMIN+10 dwmblocks";
 
 ## Limitations
 
-- Fixed 3 sections, no per-channel balance, no card profile switching.
-  Use `spawn` to hand those off to `pavucontrol`, `helvum` or `wpctl`.
+- Fixed 3 sections, no card profile switching.
 - Long node names are cut to fit the terminal width.
 - Needs WirePlumber. Plain PipeWire without a session manager has no `wpctl`.
