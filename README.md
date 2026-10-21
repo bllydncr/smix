@@ -165,9 +165,11 @@ static const char *postcmd = "pkill -RTMIN+10 dwmblocks";
   selection is tracked by node ID, so it survives list changes.
 - Channel volumes are read with `pactl list <kind>` and written with
   `pactl set-<kind>-volume <index> <p1>% <p2>% ...`. This goes through
-  pipewire-pulse, which also drives hardware (ALSA route) volumes. Sinks and
-  sources are matched to wpctl ids by pulse index, streams by their
-  `object.id` property, because stream indexes differ from wpctl ids.
+  pipewire-pulse, which also drives hardware (ALSA route) volumes. Pulse
+  indexes do not reliably equal wpctl ids, so each pactl entry is matched to
+  the node (via `wpctl inspect`) by `object.id`, then `object.serial`, then
+  `node.name`, then pulse index, and finally by the device description.
+  If nothing matches, the status line shows the node id and serial.
 - Stream entries in `wpctl status` carry no volume, so smix asks
   `wpctl get-volume <id>` for each stream. With many streams, raise
   `refreshms`.

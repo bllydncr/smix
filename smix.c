@@ -73,59 +73,117 @@ getvol(int id, int *vol, int *muted)
 /*
  * Per-channel volumes go through the pulse layer (pactl + pipewire-pulse),
  * the same path pulsemixer uses, so hardware (ALSA route) volumes work too.
- * Pulse indexes equal wpctl ids for sinks/sources but not for streams, so
- * blocks are matched on their object.id property.
+ * Pulse indexes do not reliably equal wpctl ids, so a pulse block is matched
+ * to the node by object.id, object.serial or node name (all via wpctl inspect).
  */
-typedef struct { int idx, objid, n, v[MAXCH]; char nm[MAXCH][16]; } Blk;
+typedef struct {
+	int idx, objid, serial, n, v[MAXCH];
+	char nm[MAXCH][16], desc[128], nname[128];
+} Blk;
+typedef struct { int id, serial; char desc[128], nname[128]; } Tgt;
 
 static const char *pk[]   = { "sinks", "sources", "sink-inputs", "source-outputs" };
 static const char *pset[] = { "sink", "source", "sink-input", "source-output" };
 static int chkind, chidx;
+static char chwhy[160];
 static const struct { const char *l, *s; } chshort[] = {
 	{ "front-left", "FL" }, { "front-right", "FR" }, { "front-center", "FC" },
 	{ "rear-left", "RL" }, { "rear-right", "RR" }, { "rear-center", "RC" },
 	{ "side-left", "SL" }, { "side-right", "SR" }, { "lfe", "LFE" },
 };
 
-static int
-take(const Blk *b, int id, int kind)
+/* copy `"value"` (or bare value) after "key = " into out */
+static void
+grab(const char *p, char *out, size_t sz)
 {
-	int i;
+	if (*p == '"')
+		p++;
+	snprintf(out, sz, "%s", p);
+	out[strcspn(out, "\"\n")] = 0;
+}
 
-	if (!b->n || !(b->objid == id || (b->objid < 0 && b->idx == id)))
-		return 0;
-	for (i = 0; i < b->n; i++) {
-		chv[i] = b->v[i];
-		snprintf(chname[i], sizeof chname[i], "%s", b->nm[i]);
+/* object.serial and node.name of the wpctl node */
+static void
+tgtinfo(Tgt *t)
+{
+	char line[512], cmd[64], *p;
+	FILE *f;
+
+	snprintf(cmd, sizeof cmd, "wpctl inspect %d 2>/dev/null", t->id);
+	if (!(f = popen(cmd, "r")))
+		return;
+	while (fgets(line, sizeof line, f)) {
+		if ((p = strstr(line, "object.serial = "))) {
+			t->serial = atoi(p[16] == '"' ? p + 17 : p + 16);
+		} else if ((p = strstr(line, "node.name = ")))
+			grab(p + 12, t->nname, sizeof t->nname);
 	}
-	chn = b->n;
-	chidx = b->idx;
-	chkind = kind;
-	return 1;
+	pclose(f);
+}
+
+/* how well a pactl block matches the node; -1 = not at all */
+static int
+score(const Blk *b, const Tgt *t, const char *name)
+{
+	if (!b->n)
+		return -1;
+	if (b->objid == t->id)
+		return 5;
+	if (t->serial > 0 && (b->serial == t->serial || b->idx == t->serial))
+		return 4;
+	if (t->nname[0] && !strcmp(b->nname, t->nname))
+		return 3;
+	if (b->objid < 0 && b->idx == t->id)
+		return 2;
+	if (b->desc[0] && !strcmp(b->desc, name))
+		return 1;
+	return -1;
 }
 
 static int
-pulsech(int kind, int id)
+pulsech(int kind, const Tgt *t, const char *name, Blk *best)
 {
-	char line[512], cmd[64], *p, *q, *e;
+	static char line[4096];
+	char cmd[64], *p, *q, *e;
 	const char *s;
 	size_t k, len;
 	Blk b;
 	FILE *f;
-	int found = 0;
+	int sc, bs = -1, skip = 0;
 
 	snprintf(cmd, sizeof cmd, "pactl list %s 2>/dev/null", pk[kind]);
 	if (!(f = popen(cmd, "r")))
-		return 0;
+		return -1;
 	memset(&b, 0, sizeof b);
 	b.objid = -1;
-	while (fgets(line, sizeof line, f)) {
-		if (line[0] != '\t' && line[0] != ' ' && (p = strchr(line, '#'))) {
-			if ((found = take(&b, id, kind)))
+	for (;;) {
+		p = fgets(line, sizeof line, f);
+		if (p) {
+			len = strlen(line);
+			if (skip) { /* tail of an overlong line */
+				skip = line[len - 1] != '\n';
+				continue;
+			}
+			skip = line[len - 1] != '\n';
+		}
+		/* block boundary: header or EOF */
+		if (!p || (isupper((unsigned char)line[0]) &&
+		    (p = strstr(line, " #")) && p - line < 20)) {
+			if ((sc = score(&b, t, name)) > bs) {
+				bs = sc;
+				*best = b;
+			}
+			if (!p)
 				break;
 			memset(&b, 0, sizeof b);
-			b.idx = atoi(p + 1);
+			b.idx = atoi(p + 2);
 			b.objid = -1;
+			if (bs == 5)
+				break;
+		} else if (!strncmp(line, "\tDescription: ", 14)) {
+			grab(line + 14, b.desc, sizeof b.desc);
+		} else if (!strncmp(line, "\t\tnode.name = ", 14)) {
+			grab(line + 14, b.nname, sizeof b.nname);
 		} else if (!strncmp(line, "\tVolume:", 8)) {
 			p = line + 8;
 			while (b.n < MAXCH && (q = strchr(p, ':'))) {
@@ -149,31 +207,62 @@ pulsech(int kind, int id)
 			}
 		} else if ((p = strstr(line, "object.id = \"")))
 			b.objid = atoi(p + 13);
+		else if ((p = strstr(line, "object.serial = \"")))
+			b.serial = atoi(p + 17);
 	}
-	if (!found)
-		found = take(&b, id, kind);
 	pclose(f);
-	return found;
+	return bs;
 }
 
 static void
 loadch(void)
 {
-	int i, found = 0;
+	Tgt t;
+	Blk best, b2;
+	int i, at = -1, s1, s2 = -1, k1, k2 = 0;
 
 	chn = 0;
 	if (openid < 0)
 		return;
 	for (i = 0; i < cnt[tab]; i++)
 		if (nodes[tab][i].id == openid)
-			found = 1;
-	if (!found) {
+			at = i;
+	if (at < 0) {
 		openid = chsel = -1;
 		return;
 	}
-	found = tab == STREAM ? pulsech(2, openid) || pulsech(3, openid)
-	                      : pulsech(tab, openid);
-	if (!found || chn < 2) {
+	memset(&t, 0, sizeof t);
+	t.id = openid;
+	tgtinfo(&t);
+	memset(&best, 0, sizeof best);
+	memset(&b2, 0, sizeof b2);
+	k1 = tab == STREAM ? 2 : tab;
+	s1 = pulsech(k1, &t, nodes[tab][at].name, &best);
+	if (tab == STREAM) {
+		k2 = 3;
+		s2 = pulsech(k2, &t, nodes[tab][at].name, &b2);
+		if (s2 > s1) {
+			best = b2;
+			s1 = s2;
+			k1 = k2;
+		}
+	}
+	if (s1 >= 0) {
+		for (i = 0; i < best.n; i++) {
+			chv[i] = best.v[i];
+			snprintf(chname[i], sizeof chname[i], "%s", best.nm[i]);
+		}
+		chn = best.n;
+		chidx = best.idx;
+		chkind = k1;
+	}
+	if (s1 < 0)
+		snprintf(chwhy, sizeof chwhy,
+		    " no channel info for id %d serial %d (needs pactl + pipewire-pulse)",
+		    t.id, t.serial);
+	else
+		snprintf(chwhy, sizeof chwhy, " this node has only one channel");
+	if (s1 < 0 || chn < 2) {
 		chn = 0;
 		openid = chsel = -1;
 	} else if (chsel >= chn)
@@ -382,7 +471,7 @@ togglech(const Arg *a)
 	chsel = -1;
 	loadch();
 	if (openid < 0)
-		msg = " no channel info (needs pactl from pulseaudio-utils + pipewire-pulse, >= 2 channels)";
+		msg = chwhy;
 }
 
 /* space: lock channels together (all move by the same amount) or not */
