@@ -170,6 +170,10 @@ static const char *postcmd = "pkill -RTMIN+10 dwmblocks";
   the node (via `wpctl inspect`) by `object.id`, then `object.serial`, then
   `node.name`, then pulse index, and finally by the device description.
   If nothing matches, the status line shows the node id and serial.
+- Holding a key does not queue one command per repeat: all pending keys are
+  read at once and identical `volume`/`movesel` presses are merged into a
+  single bigger step. The screen updates immediately and the full refresh
+  (`wpctl status`, `pactl list`) runs once the keys stop for 150 ms.
 - Stream entries in `wpctl status` carry no volume, so smix asks
   `wpctl get-volume <id>` for each stream. With many streams, raise
   `refreshms`.

@@ -217,6 +217,7 @@ pulsech(int kind, const Tgt *t, const char *name, Blk *best)
 static void
 loadch(void)
 {
+	static Tgt tc;
 	Tgt t;
 	Blk best, b2;
 	int i, at = -1, s1, s2 = -1, k1, k2 = 0;
@@ -231,9 +232,12 @@ loadch(void)
 		openid = chsel = -1;
 		return;
 	}
-	memset(&t, 0, sizeof t);
-	t.id = openid;
-	tgtinfo(&t);
+	if (tc.id != openid || tc.serial <= 0) { /* serial/name never change: ask once */
+		memset(&tc, 0, sizeof tc);
+		tc.id = openid;
+		tgtinfo(&tc);
+	}
+	t = tc;
 	memset(&best, 0, sizeof best);
 	memset(&b2, 0, sizeof b2);
 	k1 = tab == STREAM ? 2 : tab;
@@ -515,6 +519,7 @@ volume(const Arg *a)
 			if (v > maxvol)
 				v = maxvol;
 			n += snprintf(cmd + n, sizeof cmd - n, " %d%%", v);
+			chv[i] = v;
 		}
 	} else
 		snprintf(cmd, sizeof cmd, "wpctl set-volume -l %d.%02d %%d %d%%%c",
@@ -522,6 +527,14 @@ volume(const Arg *a)
 		    a->i < 0 ? '-' : '+');
 	exec_cmd(cmd, 1);
 	exec_cmd(postcmd, 0);
+	if (!(chsel >= 0 && chn > 0 && openid >= 0) && cnt[tab]) { /* show it now, refresh later */
+		Node *nd = &nodes[tab][sel[tab]];
+		nd->vol += a->i;
+		if (nd->vol < 0)
+			nd->vol = 0;
+		if (nd->vol > maxvol)
+			nd->vol = maxvol;
+	}
 }
 
 static void
@@ -689,14 +702,51 @@ onsig(int sig)
 	running = 0;
 }
 
+/* read every pending key, merge runs of the same key into one action */
+static int
+handleinput(void)
+{
+	struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
+	int q[64], n = 0, k, i, j, c;
+	size_t b;
+	Arg a;
+
+	do {
+		if ((k = readkey()) < 0) {
+			if (!n)
+				return -1;
+			break;
+		}
+		q[n++] = k;
+	} while (n < 64 && poll(&p, 1, 0) > 0);
+
+	msg = NULL;
+	for (i = 0; i < n; i = j) {
+		for (j = i + 1; j < n && q[j] == q[i]; j++)
+			;
+		c = j - i;
+		for (b = 0; b < LEN(keys); b++) {
+			if (keys[b].key != q[i] || !keys[b].fn)
+				continue;
+			a = keys[b].arg;
+			if (keys[b].fn == volume || keys[b].fn == movesel) {
+				a.i *= c; /* key repeat: one bigger step instead of c commands */
+				keys[b].fn(&a);
+			} else
+				for (k = 0; k < c; k++)
+					keys[b].fn(&a);
+		}
+	}
+	return 0;
+}
+
 int
 main(void)
 {
 	struct termios raw;
 	struct sigaction sa = { 0 };
 	struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
-	size_t i;
-	int k, r;
+	int r, dirty = 0;
 
 	if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
 		fputs("smix: not a terminal\n", stderr);
@@ -709,6 +759,7 @@ main(void)
 	raw.c_cc[VTIME] = 0;
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 	atexit(cleanup);
+	setvbuf(stdout, NULL, _IOFBF, 1 << 16); /* one write per frame */
 	fputs("\033[?1049h\033[?25l", stdout);
 
 	sa.sa_handler = onsig; /* no SA_RESTART: poll() must wake up */
@@ -721,17 +772,16 @@ main(void)
 	refresh();
 	while (running) {
 		draw();
-		r = poll(&p, 1, refreshms);
+		/* after input, wait for a quiet moment before the expensive refresh */
+		r = poll(&p, 1, dirty ? 150 : refreshms);
 		if (r > 0 && (p.revents & POLLIN)) {
-			if ((k = readkey()) < 0)
+			if (handleinput() < 0)
 				break;
-			msg = NULL;
-			for (i = 0; i < LEN(keys); i++)
-				if (keys[i].key == k && keys[i].fn)
-					keys[i].fn(&keys[i].arg);
+			dirty = 1;
+		} else if (r == 0) {
 			refresh();
-		} else if (r == 0)
-			refresh();
+			dirty = 0;
+		}
 	}
 	return 0;
 }
